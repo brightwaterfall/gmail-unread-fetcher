@@ -55,13 +55,15 @@ const USAGE = `Usage: node index.js [options]
   -a, --account <label>  inbox label to use (default: GMAIL_ACCOUNT, else account1)
       --all              every label listed in GMAIL_ACCOUNTS
       --auth-only        sign in only; do not read or mark any mail
+  -m, --max <n>          process at most n emails per inbox (0 = no limit,
+                         overrides GMAIL_MAX_MESSAGES)
   -h, --help             show this message`;
 
 /** In-memory store of every attachment found this run. */
 export const attachments = [];
 
 function parseArgs(argv) {
-  const opts = { all: false, authOnly: false, account: null, help: false };
+  const opts = { all: false, authOnly: false, account: null, max: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all') opts.all = true;
@@ -71,11 +73,29 @@ function parseArgs(argv) {
       const value = argv[++i];
       if (!value) throw new Error(`Missing value for ${a}.\n\n${USAGE}`);
       opts.account = value;
+    } else if (a === '--max' || a === '-m') {
+      const value = argv[++i];
+      if (!value) throw new Error(`Missing value for ${a}.\n\n${USAGE}`);
+      opts.max = value;
     } else {
       throw new Error(`Unknown argument: ${a}\n\n${USAGE}`);
     }
   }
   return opts;
+}
+
+/** Highest number of emails to handle per inbox. 0 means no limit. */
+function resolveMaxMessages(opts) {
+  const raw = opts.max ?? process.env.GMAIL_MAX_MESSAGES;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return 0;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(
+      `Message limit must be a whole number of 0 or more (got "${raw}"). ` +
+        'Set GMAIL_MAX_MESSAGES in .env or pass --max <n>; 0 means no limit.'
+    );
+  }
+  return value;
 }
 
 function resolveAccounts(opts) {
@@ -392,15 +412,16 @@ async function fetchAttachmentBytes(gmail, messageId, meta) {
   return decodeBase64Url(res.data.data);
 }
 
-async function listUnreadIds(gmail) {
+async function listUnreadIds(gmail, limit = 0) {
   const ids = [];
   let pageToken;
   do {
-    const res = await gmail.users.messages.list({ userId: 'me', q: QUERY, maxResults: 500, pageToken });
+    const maxResults = limit ? Math.min(500, limit - ids.length) : 500;
+    const res = await gmail.users.messages.list({ userId: 'me', q: QUERY, maxResults, pageToken });
     for (const m of res.data.messages || []) ids.push(m.id);
     pageToken = res.data.nextPageToken;
-  } while (pageToken);
-  return ids;
+  } while (pageToken && (!limit || ids.length < limit));
+  return limit ? ids.slice(0, limit) : ids;
 }
 
 async function processMessage(gmail, messageId, account) {
@@ -460,7 +481,7 @@ async function processMessage(gmail, messageId, account) {
   });
 }
 
-async function runAccount(account, { authOnly }) {
+async function runAccount(account, { authOnly, maxMessages = 0 }) {
   console.log(`\n##### Gmail account label: ${account} #####`);
 
   const oAuth2Client = await authorize(createOAuthClient(account), account);
@@ -473,13 +494,16 @@ async function runAccount(account, { authOnly }) {
 
   if (authOnly) return { account, email, processed: 0, failed: 0 };
 
-  const ids = await listUnreadIds(gmail);
+  const ids = await listUnreadIds(gmail, maxMessages);
   if (!ids.length) {
     console.log('No unread messages.');
     return { account, email, processed: 0, failed: 0 };
   }
 
-  console.log(`Found ${ids.length} unread message(s).\n`);
+  const capped = maxMessages && ids.length === maxMessages;
+  console.log(
+    `Found ${ids.length} unread message(s)${capped ? ` (limit of ${maxMessages} reached; the rest stay unread)` : ''}.\n`
+  );
   let processed = 0;
   let failed = 0;
   for (const id of ids) {
@@ -521,11 +545,12 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   const accounts = resolveAccounts(opts);
+  const maxMessages = resolveMaxMessages(opts);
   const results = [];
 
   for (const account of accounts) {
     try {
-      results.push(await runAccount(account, opts));
+      results.push(await runAccount(account, { ...opts, maxMessages }));
     } catch (err) {
       console.error(`[${account}] Fatal: ${describeError(err)}`);
       results.push({ account, error: describeError(err) });
