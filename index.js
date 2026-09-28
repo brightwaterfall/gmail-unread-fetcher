@@ -9,15 +9,36 @@
  *
  * Tokens: tokens/<account>.json  (one file per Gmail inbox)
  */
-'use strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+import http from 'node:http';
+import { fileURLToPath } from 'node:url';
+import { google } from 'googleapis';
 
-require('dotenv').config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const fs = require('fs');
-const path = require('path');
-const readline = require('readline');
-const http = require('http');
-const { google } = require('googleapis');
+/** Load .env via Node's built-in API (no dotenv). Does not override vars already set. */
+function loadEnvFile() {
+  const envPath = [path.join(__dirname, '.env'), path.join(process.cwd(), '.env')].find((p) =>
+    fs.existsSync(p)
+  );
+  if (!envPath) return;
+  if (typeof process.loadEnvFile !== 'function') {
+    console.warn(
+      `Node ${process.versions.node} cannot read .env by itself. ` +
+        'Upgrade to Node 20.12+, or run with: node --env-file=.env index.js'
+    );
+    return;
+  }
+  try {
+    process.loadEnvFile(envPath);
+  } catch {
+    /* unreadable or malformed — requireEnv will report what is missing */
+  }
+}
+
+loadEnvFile();
 
 const SCOPES = ['https://www.googleapis.com/auth/gmail.modify'];
 const SAVE_TO_DISK = process.env.SAVE_ATTACHMENTS_TO_DISK !== '0';
@@ -26,16 +47,33 @@ const ATTACHMENTS_DIR = path.resolve(process.env.GMAIL_ATTACHMENTS_DIR || path.j
 const ACCOUNTS_FILE = path.join(TOKENS_DIR, 'accounts.json');
 const QUERY = process.env.GMAIL_QUERY || 'is:unread';
 
+/** Windows refuses these as file or folder names. */
+const RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+const USAGE = `Usage: node index.js [options]
+
+  -a, --account <label>  inbox label to use (default: GMAIL_ACCOUNT, else account1)
+      --all              every label listed in GMAIL_ACCOUNTS
+      --auth-only        sign in only; do not read or mark any mail
+  -h, --help             show this message`;
+
 /** In-memory store of every attachment found this run. */
-const attachments = [];
+export const attachments = [];
 
 function parseArgs(argv) {
-  const opts = { all: false, authOnly: false, account: null };
+  const opts = { all: false, authOnly: false, account: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all') opts.all = true;
     else if (a === '--auth-only') opts.authOnly = true;
-    else if ((a === '--account' || a === '-a') && argv[i + 1]) opts.account = argv[++i];
+    else if (a === '--help' || a === '-h') opts.help = true;
+    else if (a === '--account' || a === '-a') {
+      const value = argv[++i];
+      if (!value) throw new Error(`Missing value for ${a}.\n\n${USAGE}`);
+      opts.account = value;
+    } else {
+      throw new Error(`Unknown argument: ${a}\n\n${USAGE}`);
+    }
   }
   return opts;
 }
@@ -58,6 +96,9 @@ function sanitizeAccount(name) {
   const cleaned = String(name).trim().replace(/[^a-zA-Z0-9._-]/g, '_');
   if (!cleaned) throw new Error('Account name is empty after sanitizing');
   if (cleaned === 'accounts') throw new Error('"accounts" is reserved; pick another account label');
+  if (RESERVED_NAMES.test(cleaned)) {
+    throw new Error(`"${cleaned}" is a reserved device name; pick another account label`);
+  }
   return cleaned;
 }
 
@@ -69,12 +110,25 @@ function requireEnv(name) {
   return value;
 }
 
-function createOAuthClient() {
-  return new google.auth.OAuth2(
-    requireEnv('GOOGLE_CLIENT_ID'),
-    requireEnv('GOOGLE_CLIENT_SECRET'),
-    requireEnv('GOOGLE_REDIRECT_URI')
-  );
+/** Prefer ACCOUNT1-style vars, then fall back to the shared GOOGLE_* vars. */
+function envForAccount(account, base) {
+  const upper = String(account).toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  const specific = process.env[`${base}_${upper}`];
+  if (specific && !/^your-/i.test(specific)) return specific;
+  return requireEnv(base);
+}
+
+function credentialsFor(account) {
+  return {
+    clientId: envForAccount(account, 'GOOGLE_CLIENT_ID'),
+    clientSecret: envForAccount(account, 'GOOGLE_CLIENT_SECRET'),
+    redirectUri: envForAccount(account, 'GOOGLE_REDIRECT_URI'),
+  };
+}
+
+function createOAuthClient(account) {
+  const { clientId, clientSecret, redirectUri } = credentialsFor(account);
+  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 }
 
 function tokenPathFor(account) {
@@ -141,7 +195,7 @@ async function authorize(oAuth2Client, account) {
   console.log('After approving, the tab should say "Auth complete". If it does not,');
   console.log('paste the full redirect URL (or just the code= value) below.\n');
 
-  const code = await obtainAuthCode();
+  const code = await obtainAuthCode(credentialsFor(account).redirectUri);
   const { tokens } = await oAuth2Client.getToken(code);
   oAuth2Client.setCredentials(tokens);
   fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2));
@@ -168,10 +222,10 @@ function extractCode(pasted) {
  * Wait for the OAuth code: either the browser hits the local redirect server,
  * or the user pastes the redirect URL / code into the terminal. Whichever comes first wins.
  */
-function obtainAuthCode() {
+function obtainAuthCode(redirectUri) {
   let redirect = null;
   try {
-    redirect = new URL(requireEnv('GOOGLE_REDIRECT_URI'));
+    redirect = new URL(redirectUri || requireEnv('GOOGLE_REDIRECT_URI'));
   } catch {
     /* fall back to paste */
   }
@@ -306,12 +360,23 @@ function headerValue(headers, name) {
   return h ? h.value : '';
 }
 
-/** "a.pdf" → "a (2).pdf" when a name is already taken within the same message. */
+/**
+ * Make a sender-supplied filename safe to write, then "a.pdf" → "a (2).pdf"
+ * when the name is already taken within the same message.
+ */
 function uniqueFileName(name, used) {
-  const safe = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') || 'unnamed';
-  let candidate = safe;
-  const ext = path.extname(safe);
-  const stem = safe.slice(0, safe.length - ext.length);
+  let cleaned = String(name)
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/[. ]+$/, '') // Windows silently drops trailing dots and spaces
+    .trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') cleaned = 'unnamed';
+
+  const ext = path.extname(cleaned).slice(0, 20);
+  let stem = cleaned.slice(0, cleaned.length - path.extname(cleaned).length) || 'unnamed';
+  if (RESERVED_NAMES.test(stem)) stem = `_${stem}`;
+  if (stem.length > 120) stem = stem.slice(0, 120);
+
+  let candidate = `${stem}${ext}`;
   for (let n = 2; used.has(candidate.toLowerCase()); n++) candidate = `${stem} (${n})${ext}`;
   used.add(candidate.toLowerCase());
   return candidate;
@@ -398,7 +463,7 @@ async function processMessage(gmail, messageId, account) {
 async function runAccount(account, { authOnly }) {
   console.log(`\n##### Gmail account label: ${account} #####`);
 
-  const oAuth2Client = await authorize(createOAuthClient(), account);
+  const oAuth2Client = await authorize(createOAuthClient(account), account);
   const gmail = google.gmail({ version: 'v1', auth: oAuth2Client });
 
   const profile = await gmail.users.getProfile({ userId: 'me' });
@@ -435,15 +500,26 @@ async function runAccount(account, { authOnly }) {
 }
 
 function describeError(err) {
-  const msg = err?.response?.data?.error_description || err?.message || String(err);
-  if (/invalid_grant/i.test(msg) || /invalid_grant/i.test(JSON.stringify(err?.response?.data || ''))) {
+  const data = err?.response?.data;
+  const msg =
+    data?.error_description ||
+    data?.error?.message ||
+    (typeof data?.error === 'string' ? data.error : null) ||
+    err?.message ||
+    String(err);
+  if (data?.error === 'invalid_grant' || /invalid_grant/i.test(msg)) {
     return `${msg} — the saved token is expired or revoked. Delete the token file and authorize again.`;
   }
   return msg;
 }
 
-async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2)) {
   const opts = parseArgs(argv);
+  if (opts.help) {
+    console.log(USAGE);
+    return [];
+  }
+
   const accounts = resolveAccounts(opts);
   const results = [];
 
@@ -469,9 +545,19 @@ async function main(argv = process.argv.slice(2)) {
   return results;
 }
 
-module.exports = { main, attachments };
+/** True only when this file was the script node was told to run. */
+function isEntryPoint() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const self = fileURLToPath(import.meta.url);
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(self);
+  } catch {
+    return path.resolve(entry) === self;
+  }
+}
 
-if (require.main === module) {
+if (isEntryPoint()) {
   main()
     .then((results) => {
       process.exitCode = results.some((r) => r.error || r.failed) ? 1 : 0;

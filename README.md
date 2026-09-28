@@ -32,7 +32,7 @@ It uses Google's official Gmail API with secure OAuth sign-in. Your Gmail passwo
 ## 1. What you need
 
 - A Windows, macOS or Linux PC
-- **Node.js 18 or newer** — download the "LTS" version from [nodejs.org](https://nodejs.org/) and install with the default options
+- **Node.js 20.12 or newer** — download the "LTS" version from [nodejs.org](https://nodejs.org/) and install with the default options (needed for native `.env` loading; no `dotenv` package)
 - A Google account to create a (free) Google Cloud project
 - The three Gmail addresses you want to read
 
@@ -80,13 +80,15 @@ Google requires an "OAuth client" so the tool is allowed to access Gmail. This t
 
 Desktop clients automatically allow `http://localhost` addresses, so there is no redirect URL to configure.
 
+One client can serve all three inboxes. If your inboxes belong to different Google Cloud projects, create a Desktop client in each project and see [4.2](#42-optional-a-separate-client-per-inbox).
+
 ---
 
 ## 3. Install the tool
 
 1. Unzip / copy the project folder somewhere on your PC, e.g. `C:\gmail-unread-fetcher`.
 2. Open PowerShell **in that folder**. (In File Explorer, open the folder, click the address bar, type `powershell` and press Enter.)
-3. Install the dependencies:
+3. Install the dependency (there is only one, `googleapis`):
 
 ```powershell
 npm install
@@ -104,6 +106,8 @@ You should see `VIRTUAL TEST: PASS` at the end.
 
 ## 4. Configure the tool
 
+### 4.1 One client for all inboxes (usual case)
+
 1. Create your settings file by copying the example:
 
 ```powershell
@@ -111,6 +115,8 @@ copy .env.example .env
 ```
 
    (macOS/Linux: `cp .env.example .env`)
+
+   The file **must** be named exactly `.env`. Editing `.env.example` has no effect.
 
 2. Open `.env` in Notepad (or any text editor) and fill in the two values from step 2.4:
 
@@ -125,6 +131,27 @@ SAVE_ATTACHMENTS_TO_DISK=1
 3. Save the file.
 
 Leave `GOOGLE_REDIRECT_URI` as `http://localhost:3000` unless port 3000 is already used by another program on your PC (then use e.g. `http://localhost:3010`).
+
+### 4.2 Optional: a separate client per inbox
+
+If each inbox has its own Google Cloud project, add per-label values. The label is appended in
+capitals, so `account1` uses `..._ACCOUNT1`. Give each one a different port so sign-ins never clash:
+
+```ini
+GOOGLE_CLIENT_ID_ACCOUNT1=...apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET_ACCOUNT1=GOCSPX-...
+GOOGLE_REDIRECT_URI_ACCOUNT1=http://localhost:3000
+
+GOOGLE_CLIENT_ID_ACCOUNT2=...apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET_ACCOUNT2=GOCSPX-...
+GOOGLE_REDIRECT_URI_ACCOUNT2=http://localhost:3001
+
+GOOGLE_CLIENT_ID_ACCOUNT3=...apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET_ACCOUNT3=GOCSPX-...
+GOOGLE_REDIRECT_URI_ACCOUNT3=http://localhost:3002
+```
+
+Any label without its own values falls back to the shared `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI`. Custom labels work the same way: `billing` reads `GOOGLE_CLIENT_ID_BILLING`.
 
 ---
 
@@ -250,6 +277,7 @@ gmail-unread-fetcher/
 ```
 
 - Each email's attachments go into their own folder named after the Gmail message ID.
+- Attachment names supplied by the sender are sanitised before writing, so an attachment can never be saved outside its own message folder or overwrite another file.
 - Keep `.env` and the `tokens` folder private — they grant access to the inboxes.
 
 ---
@@ -261,6 +289,7 @@ All settings live in `.env`. Lines starting with `#` are ignored.
 | Setting | Default | Meaning |
 |---|---|---|
 | `GMAIL_ACCOUNTS` | `account1,account2,account3` | Labels processed by `fetch:all` / `auth:all` |
+| `GOOGLE_CLIENT_ID_<LABEL>` and friends | — | Per-inbox OAuth client, see [4.2](#42-optional-a-separate-client-per-inbox) |
 | `GMAIL_QUERY` | `is:unread` | Which emails to process, using normal Gmail search syntax |
 | `SAVE_ATTACHMENTS_TO_DISK` | `1` | Set to `0` to not write attachments to disk |
 | `GMAIL_ACCOUNT` | `account1` | Label used by plain `npm start` |
@@ -330,7 +359,9 @@ The output of every run is appended to `run-log.txt` in the project folder.
 
 | Message / symptom | Cause and fix |
 |---|---|
-| `Missing required env var: GOOGLE_CLIENT_ID` | `.env` is missing or still has the example values. Redo [section 4](#4-configure-the-tool). |
+| `Missing required env var: GOOGLE_CLIENT_ID` | `.env` is missing, is still named `.env.example`, or still holds the placeholder values. Redo [section 4](#4-configure-the-tool). |
+| `Unknown argument: ...` | A mistyped option. Run `npm start -- --help` to see the valid ones. |
+| `Node ... cannot read .env by itself` | Node is older than 20.12. Upgrade Node, or run `node --env-file=.env index.js --all`. |
 | Browser: **"Access blocked"** / **Error 403: access_denied** | That Gmail is not a test user. Add it in Google Cloud ([2.3](#23-configure-the-consent-screen)) and try again. |
 | Browser: **"Google hasn't verified this app"** | Normal for a private project. Click **Continue**. |
 | `OAuth error from Google: access_denied` | You clicked Cancel/Deny. Run the `auth` command again and approve. |
@@ -379,18 +410,19 @@ A connection also stops working if the Gmail password is changed or access is re
 | `npm start -- --account <label>` | Process one account by any label |
 | `npm start -- --auth-only --account <label>` | Connect one account by any label |
 | `npm start -- --all` | Same as `fetch:all` |
+| `npm start -- --help` | List the available options |
 
-Exit code is `0` on success and `1` if any account or email failed (useful for scheduled tasks and monitoring).
+Exit code is `0` on success and `1` if any account or email failed (useful for scheduled tasks and monitoring). Mistyped options are rejected instead of being ignored, so a typo can never silently run against the wrong inbox.
 
 ### For developers
 
-`index.js` exports `main(argv)` and the in-memory `attachments` array (each item: `account`, `messageId`, `filename`, `mimeType`, `size`, `data` as a `Buffer`), so the tool can be embedded in another Node.js program:
+`index.js` is an ES module. It exports `main(argv)` and the in-memory `attachments` array (each item: `account`, `messageId`, `filename`, `mimeType`, `size`, `data` as a `Buffer`), so the tool can be embedded in another Node.js program:
 
 ```js
-const { main, attachments } = require('./index.js');
+import { main, attachments } from './index.js';
 
 const results = await main(['--all']);
 console.log(results, attachments.length);
 ```
 
-Note: requiring `index.js` loads `.env` automatically.
+Importing `index.js` loads `.env` automatically via Node's built-in `process.loadEnvFile` (existing environment variables are not overwritten). The only npm dependency is `googleapis`.

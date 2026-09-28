@@ -1,6 +1,9 @@
 node_modules/
 .env
-token.json
+.env.local
 tokens/
 attachments/
 *.log
+run-log.txt
+.DS_Store
+Thumbs.db

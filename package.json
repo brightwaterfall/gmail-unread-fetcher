@@ -2,10 +2,12 @@
   "name": "gmail-unread-fetcher",
   "version": "1.0.0",
   "description": "Fetch unread Gmail (multi-account) via OAuth2",
+  "private": true,
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node mock-test.js",
+    "test": "node --import ./mock-register.js mock-test.js",
     "auth:1": "node index.js --auth-only --account account1",
     "auth:2": "node index.js --auth-only --account account2",
     "auth:3": "node index.js --auth-only --account account3",
@@ -16,10 +18,9 @@
     "fetch:all": "node index.js --all"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.12"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
     "googleapis": "^144.0.0"
   }
 }
