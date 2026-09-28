@@ -291,10 +291,35 @@ All settings live in `.env`. Lines starting with `#` are ignored.
 | `GMAIL_ACCOUNTS` | `account1,account2,account3` | Labels processed by `fetch:all` / `auth:all` |
 | `GOOGLE_CLIENT_ID_<LABEL>` and friends | — | Per-inbox OAuth client, see [4.2](#42-optional-a-separate-client-per-inbox) |
 | `GMAIL_QUERY` | `is:unread` | Which emails to process, using normal Gmail search syntax |
+| `GMAIL_MAX_MESSAGES` | `0` (no limit) | Most emails to show/process **per inbox, per run** |
 | `SAVE_ATTACHMENTS_TO_DISK` | `1` | Set to `0` to not write attachments to disk |
 | `GMAIL_ACCOUNT` | `account1` | Label used by plain `npm start` |
 | `GMAIL_TOKENS_DIR` | `tokens` | Alternative folder for saved connections |
 | `GMAIL_ATTACHMENTS_DIR` | `attachments` | Alternative folder for attachments |
+
+### Limiting how many emails are shown
+
+By default every matching email is processed. To handle only a few at a time, set a limit in `.env`:
+
+```ini
+# show/process at most 5 emails per inbox each run
+GMAIL_MAX_MESSAGES=5
+```
+
+The limit applies **to each inbox separately**, so `GMAIL_MAX_MESSAGES=5` with three inboxes processes up to 15 emails in a `fetch:all` run. Emails beyond the limit are left **unread** and are picked up on the next run, so nothing is skipped permanently. The console says when a limit was hit:
+
+```text
+Found 5 unread message(s) (limit of 5 reached; the rest stay unread).
+```
+
+For a single run you can override it without editing `.env`:
+
+```powershell
+npm start -- --all --max 3
+npm run fetch:1 -- --max 1     # handy for a first careful test
+```
+
+Use `0` (or leave it blank) for no limit.
 
 ### Useful `GMAIL_QUERY` examples
 
@@ -410,6 +435,7 @@ A connection also stops working if the Gmail password is changed or access is re
 | `npm start -- --account <label>` | Process one account by any label |
 | `npm start -- --auth-only --account <label>` | Connect one account by any label |
 | `npm start -- --all` | Same as `fetch:all` |
+| `npm start -- --max <n>` | Limit this run to `n` emails per inbox |
 | `npm start -- --help` | List the available options |
 
 Exit code is `0` on success and `1` if any account or email failed (useful for scheduled tasks and monitoring). Mistyped options are rejected instead of being ignored, so a typo can never silently run against the wrong inbox.

@@ -76,6 +76,21 @@ try {
   assert.deepStrictEqual(await main(['--help']), [], '--help prints usage and does nothing else');
   await assert.rejects(() => main(['--bogus']), /Unknown argument/, 'typo-ed flags are rejected');
   await assert.rejects(() => main(['--account']), /Missing value/, 'a flag without its value is rejected');
+  await assert.rejects(() => main(['--max', 'abc']), /whole number/, 'a non-numeric limit is rejected');
+  await assert.rejects(() => main(['--max', '-2']), /whole number/, 'a negative limit is rejected');
+
+  // --max stops after one email and never asks for the second page
+  const before = modifyCalls.length;
+  const [limited] = await main(['--account', 'account1', '--max', '1']);
+  assert.strictEqual(limited.processed, 1, '--max 1 processes exactly one email');
+  assert.strictEqual(limited.failed, 0, 'the broken email on page 2 is never fetched');
+  assert.strictEqual(modifyCalls.length - before, 1, 'only the one email is marked read');
+
+  // GMAIL_MAX_MESSAGES does the same thing from .env
+  process.env.GMAIL_MAX_MESSAGES = '1';
+  const [fromEnv] = await main(['--account', 'account2']);
+  assert.strictEqual(fromEnv.processed, 1, 'GMAIL_MAX_MESSAGES limits the run too');
+  delete process.env.GMAIL_MAX_MESSAGES;
 
   assert.strictEqual(unhandled, 0, 'no unhandled rejections');
   console.log('\nVIRTUAL TEST: PASS');
